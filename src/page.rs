@@ -8,6 +8,14 @@ use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use crate::element::Element;
 use crate::error::{Error, Result};
 
+/// Data extracted from a single element by `query_selector_all_with_data`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ElementData {
+    pub tag: String,
+    pub text: String,
+    pub attributes: std::collections::HashMap<String, String>,
+}
+
 /// Represents a form field discovered on the page.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FormField {
@@ -167,27 +175,95 @@ impl Page {
         Ok(())
     }
 
-    /// Wait for an element matching the given CSS selector to appear in the DOM.
-    /// Polls every 100ms up to the configured default timeout.
-    pub async fn wait_for_selector(&self, selector: &str) -> Result<Element> {
-        let timeout = self.default_timeout;
-        let interval = Duration::from_millis(100);
-        let start = std::time::Instant::now();
+    /// Fill multiple form fields in a single operation.
+    /// Each entry is (css_selector, value). Much faster than calling `type_text`
+    /// repeatedly because it batches everything into one JS evaluation.
+    /// Dispatches `input`, `change`, and `blur` events for framework compatibility.
+    pub async fn fill_form(&self, fields: &[(&str, &str)]) -> Result<()> {
+        let fields_json = serde_json::to_string(
+            &fields.iter().map(|(s, v)| serde_json::json!({"selector": s, "value": v}))
+                .collect::<Vec<_>>()
+        ).map_err(|e| Error::JsError(e.to_string()))?;
 
-        loop {
-            match self.find_element(selector).await {
-                Ok(el) => return Ok(el),
-                Err(_) if start.elapsed() < timeout => {
-                    tokio::time::sleep(interval).await;
+        let js = format!(
+            r#"(() => {{
+                const fields = {fields_json};
+                const errors = [];
+                for (const f of fields) {{
+                    const el = document.querySelector(f.selector);
+                    if (!el) {{ errors.push('Not found: ' + f.selector); continue; }}
+                    el.focus();
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    )?.set || Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value'
+                    )?.set;
+                    if (nativeInputValueSetter) {{
+                        nativeInputValueSetter.call(el, f.value);
+                    }} else {{
+                        el.value = f.value;
+                    }}
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    el.blur();
+                }}
+                if (errors.length > 0) throw new Error(errors.join('; '));
+            }})()"#,
+        );
+
+        self.inner
+            .evaluate(js)
+            .await
+            .map_err(|e| Error::JsError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Wait for an element matching the given CSS selector to appear in the DOM.
+    /// Uses a MutationObserver for near-instant detection instead of polling.
+    pub async fn wait_for_selector(&self, selector: &str) -> Result<Element> {
+        let selector_js = serde_json::to_string(selector)
+            .map_err(|e| Error::JsError(e.to_string()))?;
+        let timeout_ms = self.default_timeout.as_millis() as u64;
+
+        let js = format!(
+            r#"new Promise((resolve, reject) => {{
+                const sel = {selector_js};
+                const existing = document.querySelector(sel);
+                if (existing) {{ resolve(true); return; }}
+                const timer = setTimeout(() => {{
+                    observer.disconnect();
+                    reject(new Error('Timeout waiting for selector: ' + sel));
+                }}, {timeout_ms});
+                const observer = new MutationObserver(() => {{
+                    if (document.querySelector(sel)) {{
+                        observer.disconnect();
+                        clearTimeout(timer);
+                        resolve(true);
+                    }}
+                }});
+                observer.observe(document.documentElement, {{
+                    childList: true,
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['class', 'id', 'style', 'hidden']
+                }});
+            }})"#,
+        );
+
+        self.inner
+            .evaluate(js)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("Timeout waiting for selector") {
+                    Error::Timeout(format!("Timed out waiting for selector: {}", selector))
+                } else {
+                    Error::JsError(msg)
                 }
-                Err(_) => {
-                    return Err(Error::Timeout(format!(
-                        "Timed out waiting for selector: {}",
-                        selector
-                    )));
-                }
-            }
-        }
+            })?;
+
+        // Element is now in the DOM — get a proper Element handle
+        self.find_element(selector).await
     }
 
     /// Wait for a navigation to complete.
@@ -228,6 +304,32 @@ impl Page {
     pub async fn screenshot_full_page(&self) -> Result<Vec<u8>> {
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
+            .full_page(true)
+            .build();
+        self.inner
+            .screenshot(params)
+            .await
+            .map_err(|e| Error::ScreenshotError(e.to_string()))
+    }
+
+    /// Take a screenshot as JPEG with the given quality (0-100).
+    /// JPEG screenshots are typically 3-10x smaller than PNG.
+    pub async fn screenshot_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
+        let params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Jpeg)
+            .quality(quality as i64)
+            .build();
+        self.inner
+            .screenshot(params)
+            .await
+            .map_err(|e| Error::ScreenshotError(e.to_string()))
+    }
+
+    /// Take a full-page screenshot as JPEG with the given quality (0-100).
+    pub async fn screenshot_full_page_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
+        let params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Jpeg)
+            .quality(quality as i64)
             .full_page(true)
             .build();
         self.inner
@@ -359,8 +461,11 @@ impl Page {
 
                     // Skip invisible elements
                     if (['script','style','noscript','meta','link','head'].includes(tag)) return lines;
-                    const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden') return lines;
+                    if (typeof el.checkVisibility === 'function') {
+                        if (!el.checkVisibility({checkOpacity: false, checkVisibilityCSS: true})) return lines;
+                    } else if (el.offsetParent === null && tag !== 'body' && tag !== 'html') {
+                        return lines;
+                    }
 
                     const role = getRole(el);
                     const label = getLabel(el);
@@ -427,6 +532,50 @@ impl Page {
             .await
             .map_err(|e| Error::JsError(e.to_string()))?;
         Ok(())
+    }
+
+    // ── Batch Queries ─────────────────────────────────────────────
+
+    /// Query all elements matching a CSS selector and extract their text content
+    /// and specified attributes in a single CDP call.
+    pub async fn query_selector_all_with_data(
+        &self,
+        selector: &str,
+        attributes: &[&str],
+    ) -> Result<Vec<ElementData>> {
+        let selector_js = serde_json::to_string(selector)
+            .map_err(|e| Error::JsError(e.to_string()))?;
+        let attrs_js = serde_json::to_string(attributes)
+            .map_err(|e| Error::JsError(e.to_string()))?;
+
+        let js = format!(
+            r#"JSON.stringify(
+                Array.from(document.querySelectorAll({selector_js})).map(el => {{
+                    const attrs = {{}};
+                    for (const name of {attrs_js}) {{
+                        const val = el.getAttribute(name);
+                        if (val !== null) attrs[name] = val;
+                    }}
+                    return {{
+                        tag: el.tagName.toLowerCase(),
+                        text: (el.innerText || '').trim().substring(0, 500),
+                        attributes: attrs
+                    }};
+                }})
+            )"#
+        );
+
+        let result = self
+            .inner
+            .evaluate(js)
+            .await
+            .map_err(|e| Error::JsError(e.to_string()))?;
+        let json_str: String = result
+            .into_value()
+            .map_err(|e| Error::JsError(e.to_string()))?;
+        let elements: Vec<ElementData> =
+            serde_json::from_str(&json_str).map_err(|e| Error::JsError(e.to_string()))?;
+        Ok(elements)
     }
 
     // ── Element Queries ─────────────────────────────────────────────

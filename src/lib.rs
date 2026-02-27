@@ -8,4 +8,4 @@ pub mod stealth;
 pub use browser::AgenticBrowser;
 pub use config::{BrowserBuilder, BrowserConfig, ProxyConfig};
 pub use error::{Error, Result};
-pub use page::{FormField, Page};
+pub use page::{ElementData, FormField, Page};

@@ -1,4 +1,3 @@
-use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
 use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
 use chromiumoxide::page::Page as CrPage;
 
@@ -24,18 +23,14 @@ pub fn stealth_key_args() -> Vec<&'static str> {
 pub fn stealth_kv_args() -> Vec<(&'static str, &'static str)> {
     vec![
         ("disable-blink-features", "AutomationControlled"),
+        ("user-agent", STEALTH_USER_AGENT),
     ]
 }
 
 /// Inject all stealth evasion scripts into a page so they run before any site JS.
 pub async fn apply_stealth(page: &CrPage) -> Result<()> {
-    // 1. Override user-agent via CDP (more reliable than Chrome flag)
-    let ua_params = SetUserAgentOverrideParams::new(STEALTH_USER_AGENT);
-    page.execute(ua_params)
-        .await
-        .map_err(|e| Error::JsError(format!("Failed to set user agent: {e}")))?;
-
-    // 2. Inject stealth JS to run before any site scripts
+    // User-agent is set via Chrome launch arg (--user-agent) in stealth_kv_args()
+    // which is more reliable (covers subframes, service workers) and saves a CDP call.
     let params = AddScriptToEvaluateOnNewDocumentParams::new(STEALTH_JS);
     page.execute(params)
         .await
