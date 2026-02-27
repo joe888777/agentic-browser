@@ -50,11 +50,13 @@ fn stealth_js() -> String {
     format!(
         r#"
 // === navigator.webdriver ===
-// Delete the property entirely, then redefine as undefined (like a real browser)
-delete Object.getPrototypeOf(navigator).webdriver;
-Object.defineProperty(navigator, 'webdriver', {{
-    get: () => undefined,
+// Real non-automated Chrome has webdriver = false on Navigator.prototype.
+// Headless/automated Chrome sets it to true. We redefine it on the prototype
+// to return false, matching a real browser exactly.
+Object.defineProperty(Navigator.prototype, 'webdriver', {{
+    get: () => false,
     configurable: true,
+    enumerable: true,
 }});
 
 // === window.chrome runtime ===
