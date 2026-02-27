@@ -4,19 +4,26 @@ use chromiumoxide::page::Page as CrPage;
 
 use crate::error::{Error, Result};
 
-/// The user-agent string to use in stealth mode (Chrome 120 on macOS).
+/// The user-agent string to use in stealth mode (Chrome 145 on macOS).
 pub const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 /// Returns the Chrome launch arguments needed for stealth mode.
-pub fn stealth_args() -> Vec<&'static str> {
+/// Note: chromiumoxide adds `--` prefix automatically, so keys must NOT include `--`.
+/// Key-only args use `&str`, key-value args use `(&str, &str)`.
+pub fn stealth_key_args() -> Vec<&'static str> {
     vec![
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--disable-extensions",
-        "--disable-default-apps",
-        "--disable-component-update",
-        "--no-first-run",
+        "disable-infobars",
+        "disable-default-apps",
+        "disable-component-update",
+        "no-first-run",
+    ]
+}
+
+/// Returns key-value stealth args as tuples.
+pub fn stealth_kv_args() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("disable-blink-features", "AutomationControlled"),
     ]
 }
 
@@ -217,9 +224,9 @@ if (navigator.userAgentData) {{
     Object.defineProperty(navigator, 'userAgentData', {{
         get: () => ({{
             brands: [
-                {{ brand: 'Not_A Brand', version: '8' }},
-                {{ brand: 'Chromium', version: '120' }},
-                {{ brand: 'Google Chrome', version: '120' }},
+                {{ brand: 'Google Chrome', version: '145' }},
+                {{ brand: 'Chromium', version: '145' }},
+                {{ brand: 'Not?A_Brand', version: '24' }},
             ],
             mobile: false,
             platform: 'macOS',
@@ -228,10 +235,10 @@ if (navigator.userAgentData) {{
                     brands: this.brands,
                     mobile: false,
                     platform: 'macOS',
-                    platformVersion: '13.0.0',
-                    architecture: 'x86',
+                    platformVersion: '15.3.0',
+                    architecture: 'arm',
                     model: '',
-                    uaFullVersion: '120.0.0.0',
+                    uaFullVersion: '145.0.7632.117',
                 }});
             }},
         }}),

@@ -30,21 +30,26 @@ impl AgenticBrowser {
         let mut builder = CrBrowserConfig::builder();
 
         if config.headless {
-            builder = builder.no_sandbox().arg("--headless=new");
+            builder = builder.new_headless_mode().no_sandbox();
         } else {
             builder = builder.with_head().no_sandbox();
         }
 
         // Stealth: add anti-detection Chrome flags
+        // chromiumoxide adds `--` prefix automatically, so keys must NOT include `--`
         if config.stealth {
-            for arg in stealth::stealth_args() {
+            for arg in stealth::stealth_key_args() {
+                builder = builder.arg(arg);
+            }
+            for arg in stealth::stealth_kv_args() {
                 builder = builder.arg(arg);
             }
         }
 
-        // Proxy: pass --proxy-server flag to Chrome
+        // Proxy: pass proxy-server flag to Chrome
+        // Use tuple format: ("key", "value") -> --key=value
         if let Some(ref proxy) = config.proxy {
-            builder = builder.arg(format!("--proxy-server={}", proxy.server));
+            builder = builder.arg(("proxy-server", proxy.server.as_str()));
         }
 
         if let Some(ref path) = config.chrome_path {
