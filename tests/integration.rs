@@ -129,3 +129,51 @@ async fn test_query_selector_all_with_data() {
     assert!(links[0].attributes.contains_key("href"));
     assert_eq!(links[0].tag, "a");
 }
+
+#[tokio::test]
+async fn test_goto_fast() {
+    let browser = AgenticBrowser::builder()
+        .headless(true)
+        .build()
+        .await
+        .expect("Failed to launch browser");
+
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .expect("Failed to open page");
+
+    page.goto_fast("https://example.com")
+        .await
+        .expect("Failed to goto_fast");
+
+    let title = page.title().await.expect("Failed to get title");
+    assert!(title.contains("Example"), "Title was: {title}");
+}
+
+#[tokio::test]
+async fn test_block_resources() {
+    let browser = AgenticBrowser::builder()
+        .headless(true)
+        .build()
+        .await
+        .expect("Failed to launch browser");
+
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .expect("Failed to open page");
+
+    // Block images and stylesheets
+    page.block_resources(&["image", "stylesheet"])
+        .await
+        .expect("Failed to block resources");
+
+    // Navigate to a page — should still load HTML content
+    page.goto("https://example.com")
+        .await
+        .expect("Failed to navigate");
+
+    let title = page.title().await.expect("Failed to get title");
+    assert!(title.contains("Example"), "Title was: {title}");
+}

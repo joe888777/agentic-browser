@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chromiumoxide::browser::{Browser as CrBrowser, BrowserConfig as CrBrowserConfig};
 use chromiumoxide::cdp::browser_protocol::fetch::{
     self, AuthChallengeResponseResponse, ContinueWithAuthParams, EnableParams,
@@ -11,11 +13,20 @@ use crate::error::{Error, Result};
 use crate::page::Page;
 use crate::stealth;
 
+/// Chrome flags that improve performance without affecting functionality.
+const PERF_ARGS: &[&str] = &[
+    "disable-gpu",
+    "disable-extensions",
+    "metrics-recording-only",
+    "mute-audio",
+    "no-default-browser-check",
+];
+
 /// The main entry point for controlling a browser instance.
 pub struct AgenticBrowser {
     browser: CrBrowser,
     stealth: bool,
-    proxy_auth: Option<(String, String)>,
+    proxy_auth: Option<(Arc<str>, Arc<str>)>,
     default_timeout: std::time::Duration,
     _handler_task: tokio::task::JoinHandle<()>,
 }
@@ -34,6 +45,11 @@ impl AgenticBrowser {
             builder = builder.new_headless_mode().no_sandbox();
         } else {
             builder = builder.with_head().no_sandbox();
+        }
+
+        // Performance: add Chrome flags that reduce startup and load time
+        for arg in PERF_ARGS {
+            builder = builder.arg(*arg);
         }
 
         // Stealth: add anti-detection Chrome flags
@@ -78,10 +94,10 @@ impl AgenticBrowser {
             while let Some(_event) = handler.next().await {}
         });
 
-        // Extract proxy auth credentials for later use with CDP
+        // Extract proxy auth credentials for later use with CDP (Arc to avoid per-event cloning)
         let proxy_auth = config.proxy.as_ref().and_then(|p| {
             match (&p.username, &p.password) {
-                (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+                (Some(u), Some(p)) => Some((Arc::from(u.as_str()), Arc::from(p.as_str()))),
                 _ => None,
             }
         });
@@ -133,16 +149,16 @@ impl AgenticBrowser {
                 .map_err(|e| Error::LaunchError(format!("Failed to enable fetch for proxy auth: {e}")))?;
 
             // Listen for auth challenges and respond with credentials
-            let username = username.clone();
-            let password = password.clone();
+            let username = Arc::clone(username);
+            let password = Arc::clone(password);
             let page_clone = cr_page.clone();
 
             tokio::spawn(async move {
                 while let Some(event) = auth_events.next().await {
                     let auth_response = match fetch::AuthChallengeResponse::builder()
                         .response(AuthChallengeResponseResponse::ProvideCredentials)
-                        .username(username.clone())
-                        .password(password.clone())
+                        .username(username.as_ref())
+                        .password(password.as_ref())
                         .build()
                     {
                         Ok(r) => r,

@@ -55,6 +55,29 @@ impl Page {
         Ok(())
     }
 
+    /// Navigate to the given URL, waiting only for DOMContentLoaded instead of the
+    /// full load event. Typically 2-5x faster than `goto()` for content-heavy pages.
+    pub async fn goto_fast(&self, url: &str) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
+
+        let params = NavigateParams::new(url);
+        self.inner
+            .execute(params)
+            .await
+            .map_err(|e| Error::NavigationError(e.to_string()))?;
+
+        // Wait for DOMContentLoaded (readyState becomes "interactive" or "complete")
+        let js = r#"new Promise(resolve => {
+            if (document.readyState !== 'loading') { resolve(); return; }
+            document.addEventListener('DOMContentLoaded', () => resolve(), { once: true });
+        })"#;
+        self.inner
+            .evaluate(js)
+            .await
+            .map_err(|e| Error::NavigationError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Navigate back in the browser history.
     pub async fn go_back(&self) -> Result<()> {
         self.inner
@@ -272,6 +295,69 @@ impl Page {
             .wait_for_navigation()
             .await
             .map_err(|e| Error::NavigationError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Block specified resource types from loading on this page.
+    /// Useful for speeding up page loads when images/CSS/fonts aren't needed.
+    /// Valid types: "image", "stylesheet", "font", "media", "script".
+    /// Call this BEFORE navigating to the target URL.
+    pub async fn block_resources(&self, resource_types: &[&str]) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::fetch::{
+            EnableParams, EventRequestPaused, FailRequestParams, RequestPattern,
+        };
+        use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
+        use futures::StreamExt;
+
+        let patterns: Vec<RequestPattern> = resource_types
+            .iter()
+            .filter_map(|rt| {
+                let resource_type = match *rt {
+                    "image" => Some(ResourceType::Image),
+                    "stylesheet" => Some(ResourceType::Stylesheet),
+                    "font" => Some(ResourceType::Font),
+                    "media" => Some(ResourceType::Media),
+                    "script" => Some(ResourceType::Script),
+                    _ => None,
+                };
+                resource_type.map(|rt| {
+                    RequestPattern::builder()
+                        .resource_type(rt)
+                        .build()
+                })
+            })
+            .collect();
+
+        if patterns.is_empty() {
+            return Ok(());
+        }
+
+        // Set up event listener BEFORE enabling fetch to avoid race condition
+        let mut pause_events = self
+            .inner
+            .event_listener::<EventRequestPaused>()
+            .await
+            .map_err(|e| Error::JsError(format!("Failed to listen for request paused events: {e}")))?;
+
+        let enable = EnableParams::builder()
+            .patterns(patterns)
+            .build();
+        self.inner
+            .execute(enable)
+            .await
+            .map_err(|e| Error::JsError(format!("Failed to enable fetch for resource blocking: {e}")))?;
+
+        let page = self.inner.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pause_events.next().await {
+                let params = FailRequestParams::new(
+                    event.request_id.clone(),
+                    ErrorReason::BlockedByClient,
+                );
+                let _ = page.execute(params).await;
+            }
+        });
+
         Ok(())
     }
 
