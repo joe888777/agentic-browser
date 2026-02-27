@@ -1,4 +1,8 @@
 use chromiumoxide::browser::{Browser as CrBrowser, BrowserConfig as CrBrowserConfig};
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    self, AuthChallengeResponseResponse, ContinueWithAuthParams, EnableParams,
+    EventAuthRequired, EventRequestPaused,
+};
 use chromiumoxide::handler::viewport::Viewport;
 use futures::StreamExt;
 
@@ -11,6 +15,7 @@ use crate::stealth;
 pub struct AgenticBrowser {
     browser: CrBrowser,
     stealth: bool,
+    proxy_auth: Option<(String, String)>,
     _handler_task: tokio::task::JoinHandle<()>,
 }
 
@@ -35,6 +40,11 @@ impl AgenticBrowser {
             for arg in stealth::stealth_args() {
                 builder = builder.arg(arg);
             }
+        }
+
+        // Proxy: pass --proxy-server flag to Chrome
+        if let Some(ref proxy) = config.proxy {
+            builder = builder.arg(format!("--proxy-server={}", proxy.server));
         }
 
         if let Some(ref path) = config.chrome_path {
@@ -62,15 +72,25 @@ impl AgenticBrowser {
             while let Some(_event) = handler.next().await {}
         });
 
+        // Extract proxy auth credentials for later use with CDP
+        let proxy_auth = config.proxy.as_ref().and_then(|p| {
+            match (&p.username, &p.password) {
+                (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+                _ => None,
+            }
+        });
+
         Ok(Self {
             browser,
             stealth: config.stealth,
+            proxy_auth,
             _handler_task: handler_task,
         })
     }
 
     /// Open a new page (tab) navigated to the given URL.
     /// If stealth mode is enabled, anti-detection scripts are injected before navigation.
+    /// If proxy auth is configured, it handles 407 challenges automatically.
     pub async fn new_page(&self, url: &str) -> Result<Page> {
         let cr_page = self
             .browser
@@ -81,6 +101,55 @@ impl AgenticBrowser {
         // Inject stealth scripts BEFORE navigating to the target URL
         if self.stealth {
             stealth::apply_stealth(&cr_page).await?;
+        }
+
+        // Set up proxy authentication if credentials are provided
+        if let Some((ref username, ref password)) = self.proxy_auth {
+            let enable_params = EnableParams::builder()
+                .handle_auth_requests(true)
+                .build();
+            cr_page
+                .execute(enable_params)
+                .await
+                .map_err(|e| Error::LaunchError(format!("Failed to enable fetch for proxy auth: {e}")))?;
+
+            // Listen for auth challenges and respond with credentials
+            let username = username.clone();
+            let password = password.clone();
+            let page_clone = cr_page.clone();
+
+            tokio::spawn(async move {
+                let mut auth_events = page_clone
+                    .event_listener::<EventAuthRequired>()
+                    .await
+                    .unwrap();
+                while let Some(event) = auth_events.next().await {
+                    let auth_response = fetch::AuthChallengeResponse::builder()
+                        .response(AuthChallengeResponseResponse::ProvideCredentials)
+                        .username(username.clone())
+                        .password(password.clone())
+                        .build()
+                        .unwrap();
+                    let params = ContinueWithAuthParams::new(
+                        event.request_id.clone(),
+                        auth_response,
+                    );
+                    let _ = page_clone.execute(params).await;
+                }
+            });
+
+            // Also continue non-auth paused requests
+            let page_clone2 = cr_page.clone();
+            tokio::spawn(async move {
+                let mut pause_events = page_clone2
+                    .event_listener::<EventRequestPaused>()
+                    .await
+                    .unwrap();
+                while let Some(event) = pause_events.next().await {
+                    let params = fetch::ContinueRequestParams::new(event.request_id.clone());
+                    let _ = page_clone2.execute(params).await;
+                }
+            });
         }
 
         cr_page

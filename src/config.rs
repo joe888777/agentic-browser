@@ -7,6 +7,20 @@ pub struct BrowserConfig {
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub chrome_path: Option<String>,
+    /// Proxy server URL, e.g. "http://host:port", "socks5://host:port",
+    /// or with auth: "http://user:pass@host:port"
+    pub proxy: Option<ProxyConfig>,
+}
+
+/// Proxy configuration.
+#[derive(Clone)]
+pub struct ProxyConfig {
+    /// Proxy server URL (e.g. "http://host:port", "socks5://host:port")
+    pub server: String,
+    /// Optional username for proxy authentication
+    pub username: Option<String>,
+    /// Optional password for proxy authentication
+    pub password: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -17,6 +31,7 @@ impl Default for BrowserConfig {
             viewport_width: 1920,
             viewport_height: 1080,
             chrome_path: None,
+            proxy: None,
         }
     }
 }
@@ -50,6 +65,31 @@ impl BrowserBuilder {
 
     pub fn chrome_path(mut self, path: impl Into<String>) -> Self {
         self.config.chrome_path = Some(path.into());
+        self
+    }
+
+    /// Set a proxy server (e.g. "http://host:port", "socks5://host:port").
+    pub fn proxy(mut self, server: impl Into<String>) -> Self {
+        self.config.proxy = Some(ProxyConfig {
+            server: server.into(),
+            username: None,
+            password: None,
+        });
+        self
+    }
+
+    /// Set a proxy server with authentication.
+    pub fn proxy_with_auth(
+        mut self,
+        server: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.config.proxy = Some(ProxyConfig {
+            server: server.into(),
+            username: Some(username.into()),
+            password: Some(password.into()),
+        });
         self
     }
 
