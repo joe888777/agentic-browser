@@ -3,6 +3,7 @@ use crate::error::Result;
 
 pub struct BrowserConfig {
     pub headless: bool,
+    pub stealth: bool,
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub chrome_path: Option<String>,
@@ -12,6 +13,7 @@ impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             headless: true,
+            stealth: true,
             viewport_width: 1920,
             viewport_height: 1080,
             chrome_path: None,
@@ -32,6 +34,11 @@ impl BrowserBuilder {
 
     pub fn headless(mut self, headless: bool) -> Self {
         self.config.headless = headless;
+        self
+    }
+
+    pub fn stealth(mut self, stealth: bool) -> Self {
+        self.config.stealth = stealth;
         self
     }
 

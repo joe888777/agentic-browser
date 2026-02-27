@@ -5,10 +5,12 @@ use futures::StreamExt;
 use crate::config::{BrowserBuilder, BrowserConfig};
 use crate::error::{Error, Result};
 use crate::page::Page;
+use crate::stealth;
 
 /// The main entry point for controlling a browser instance.
 pub struct AgenticBrowser {
     browser: CrBrowser,
+    stealth: bool,
     _handler_task: tokio::task::JoinHandle<()>,
 }
 
@@ -26,6 +28,13 @@ impl AgenticBrowser {
             builder = builder.no_sandbox().arg("--headless=new");
         } else {
             builder = builder.with_head().no_sandbox();
+        }
+
+        // Stealth: add anti-detection Chrome flags
+        if config.stealth {
+            for arg in stealth::stealth_args() {
+                builder = builder.arg(arg);
+            }
         }
 
         if let Some(ref path) = config.chrome_path {
@@ -55,17 +64,30 @@ impl AgenticBrowser {
 
         Ok(Self {
             browser,
+            stealth: config.stealth,
             _handler_task: handler_task,
         })
     }
 
     /// Open a new page (tab) navigated to the given URL.
+    /// If stealth mode is enabled, anti-detection scripts are injected before navigation.
     pub async fn new_page(&self, url: &str) -> Result<Page> {
         let cr_page = self
             .browser
-            .new_page(url)
+            .new_page("about:blank")
             .await
             .map_err(|e| Error::NavigationError(e.to_string()))?;
+
+        // Inject stealth scripts BEFORE navigating to the target URL
+        if self.stealth {
+            stealth::apply_stealth(&cr_page).await?;
+        }
+
+        cr_page
+            .goto(url)
+            .await
+            .map_err(|e| Error::NavigationError(e.to_string()))?;
+
         Ok(Page::new(cr_page))
     }
 

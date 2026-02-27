@@ -3,11 +3,11 @@ use agentic_browser::AgenticBrowser;
 #[tokio::main]
 async fn main() -> agentic_browser::Result<()> {
     let browser = AgenticBrowser::builder().headless(true).build().await?;
-    let page = browser.new_page("https://www.google.com").await?;
+    let page = browser.new_page("https://duckduckgo.com").await?;
 
-    page.type_text("textarea[name='q']", "Rust programming language").await?;
+    page.type_text("input[name='q']", "btc").await?;
 
-    let el = page.find_element("textarea[name='q']").await?;
+    let el = page.find_element("input[name='q']").await?;
     el.press_key("Enter").await?;
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
