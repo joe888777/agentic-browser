@@ -23,11 +23,12 @@ pub struct FormField {
 /// Wrapper around a chromiumoxide Page with a simplified, agent-friendly API.
 pub struct Page {
     inner: CrPage,
+    default_timeout: Duration,
 }
 
 impl Page {
-    pub(crate) fn new(inner: CrPage) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: CrPage, default_timeout: Duration) -> Self {
+        Self { inner, default_timeout }
     }
 
     /// Returns a reference to the underlying chromiumoxide Page.
@@ -145,18 +146,19 @@ impl Page {
 
     /// Select an option in a `<select>` element by its value attribute.
     pub async fn select_option(&self, selector: &str, value: &str) -> Result<()> {
+        let selector_js = serde_json::to_string(selector)
+            .map_err(|e| Error::JsError(e.to_string()))?;
+        let value_js = serde_json::to_string(value)
+            .map_err(|e| Error::JsError(e.to_string()))?;
         let js = format!(
             r#"
             (() => {{
-                const el = document.querySelector('{}');
-                if (!el) throw new Error('Element not found: {}');
-                el.value = '{}';
+                const el = document.querySelector({selector_js});
+                if (!el) throw new Error('Element not found: ' + {selector_js});
+                el.value = {value_js};
                 el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             }})()
             "#,
-            selector.replace('\'', "\\'"),
-            selector.replace('\'', "\\'"),
-            value.replace('\'', "\\'"),
         );
         self.inner
             .evaluate(js)
@@ -166,9 +168,9 @@ impl Page {
     }
 
     /// Wait for an element matching the given CSS selector to appear in the DOM.
-    /// Polls every 100ms for up to 30 seconds.
+    /// Polls every 100ms up to the configured default timeout.
     pub async fn wait_for_selector(&self, selector: &str) -> Result<Element> {
-        let timeout = Duration::from_secs(30);
+        let timeout = self.default_timeout;
         let interval = Duration::from_millis(100);
         let start = std::time::Instant::now();
 

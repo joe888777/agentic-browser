@@ -16,6 +16,7 @@ pub struct AgenticBrowser {
     browser: CrBrowser,
     stealth: bool,
     proxy_auth: Option<(String, String)>,
+    default_timeout: std::time::Duration,
     _handler_task: tokio::task::JoinHandle<()>,
 }
 
@@ -89,6 +90,7 @@ impl AgenticBrowser {
             browser,
             stealth: config.stealth,
             proxy_auth,
+            default_timeout: config.default_timeout,
             _handler_task: handler_task,
         })
     }
@@ -110,6 +112,18 @@ impl AgenticBrowser {
 
         // Set up proxy authentication if credentials are provided
         if let Some((ref username, ref password)) = self.proxy_auth {
+            // Set up event listeners BEFORE enabling fetch domain to avoid race condition
+            let mut auth_events = cr_page
+                .event_listener::<EventAuthRequired>()
+                .await
+                .map_err(|e| Error::LaunchError(format!("Failed to listen for auth events: {e}")))?;
+
+            let mut pause_events = cr_page
+                .event_listener::<EventRequestPaused>()
+                .await
+                .map_err(|e| Error::LaunchError(format!("Failed to listen for request paused events: {e}")))?;
+
+            // Now enable fetch domain — listeners are already subscribed
             let enable_params = EnableParams::builder()
                 .handle_auth_requests(true)
                 .build();
@@ -124,17 +138,19 @@ impl AgenticBrowser {
             let page_clone = cr_page.clone();
 
             tokio::spawn(async move {
-                let mut auth_events = page_clone
-                    .event_listener::<EventAuthRequired>()
-                    .await
-                    .unwrap();
                 while let Some(event) = auth_events.next().await {
-                    let auth_response = fetch::AuthChallengeResponse::builder()
+                    let auth_response = match fetch::AuthChallengeResponse::builder()
                         .response(AuthChallengeResponseResponse::ProvideCredentials)
                         .username(username.clone())
                         .password(password.clone())
                         .build()
-                        .unwrap();
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Failed to build auth response: {e}");
+                            continue;
+                        }
+                    };
                     let params = ContinueWithAuthParams::new(
                         event.request_id.clone(),
                         auth_response,
@@ -146,10 +162,6 @@ impl AgenticBrowser {
             // Also continue non-auth paused requests
             let page_clone2 = cr_page.clone();
             tokio::spawn(async move {
-                let mut pause_events = page_clone2
-                    .event_listener::<EventRequestPaused>()
-                    .await
-                    .unwrap();
                 while let Some(event) = pause_events.next().await {
                     let params = fetch::ContinueRequestParams::new(event.request_id.clone());
                     let _ = page_clone2.execute(params).await;
@@ -162,12 +174,13 @@ impl AgenticBrowser {
             .await
             .map_err(|e| Error::NavigationError(e.to_string()))?;
 
-        Ok(Page::new(cr_page))
+        Ok(Page::new(cr_page, self.default_timeout))
     }
 
     /// Return all currently open pages (tabs).
     pub async fn pages(&self) -> Result<Vec<Page>> {
+        let timeout = self.default_timeout;
         let cr_pages = self.browser.pages().await.map_err(|e| Error::CdpError(e))?;
-        Ok(cr_pages.into_iter().map(Page::new).collect())
+        Ok(cr_pages.into_iter().map(|p| Page::new(p, timeout)).collect())
     }
 }

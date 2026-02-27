@@ -6,6 +6,6 @@ pub mod page;
 pub mod stealth;
 
 pub use browser::AgenticBrowser;
-pub use config::{BrowserConfig, ProxyConfig};
+pub use config::{BrowserBuilder, BrowserConfig, ProxyConfig};
 pub use error::{Error, Result};
 pub use page::{FormField, Page};

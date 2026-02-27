@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::browser::AgenticBrowser;
 use crate::error::Result;
 
@@ -10,6 +12,8 @@ pub struct BrowserConfig {
     /// Proxy server URL, e.g. "http://host:port", "socks5://host:port",
     /// or with auth: "http://user:pass@host:port"
     pub proxy: Option<ProxyConfig>,
+    /// Default timeout for operations like `wait_for_selector` (default: 30s).
+    pub default_timeout: Duration,
 }
 
 /// Proxy configuration.
@@ -32,6 +36,7 @@ impl Default for BrowserConfig {
             viewport_height: 1080,
             chrome_path: None,
             proxy: None,
+            default_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -68,6 +73,12 @@ impl BrowserBuilder {
         self
     }
 
+    /// Set the default timeout for operations like `wait_for_selector`.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.config.default_timeout = timeout;
+        self
+    }
+
     /// Set a proxy server (e.g. "http://host:port", "socks5://host:port").
     pub fn proxy(mut self, server: impl Into<String>) -> Self {
         self.config.proxy = Some(ProxyConfig {
@@ -99,5 +110,11 @@ impl BrowserBuilder {
 
     pub async fn build(self) -> Result<AgenticBrowser> {
         AgenticBrowser::launch(self.build_config()).await
+    }
+}
+
+impl Default for BrowserBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
