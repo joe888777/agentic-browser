@@ -22,6 +22,26 @@ const PERF_ARGS: &[&str] = &[
     "no-default-browser-check",
 ];
 
+/// Additional Chrome flags for low-resource environments (Raspberry Pi, ARM SBCs).
+/// These aggressively reduce memory and CPU usage at the cost of some features.
+const LOW_RESOURCE_ARGS: &[&str] = &[
+    "single-process",
+    "disable-dev-shm-usage",
+    "disable-software-rasterizer",
+    "disable-gpu-compositing",
+    "disable-background-networking",
+    "disable-background-timer-throttling",
+    "disable-renderer-backgrounding",
+    "disable-backgrounding-occluded-windows",
+    "disable-ipc-flooding-protection",
+    "disable-hang-monitor",
+    "disable-sync",
+    "disable-translate",
+    "disable-domain-reliability",
+    "disable-features=TranslateUI",
+    "no-zygote",
+];
+
 /// The main entry point for controlling a browser instance.
 pub struct AgenticBrowser {
     browser: CrBrowser,
@@ -50,6 +70,17 @@ impl AgenticBrowser {
         // Performance: add Chrome flags that reduce startup and load time
         for arg in PERF_ARGS {
             builder = builder.arg(*arg);
+        }
+
+        // Low-resource mode: add aggressive memory/CPU reduction flags
+        if config.low_resource {
+            for arg in LOW_RESOURCE_ARGS {
+                builder = builder.arg(*arg);
+            }
+            // Limit JS heap size
+            let heap_mb = config.js_heap_size_mb.unwrap_or(256);
+            let js_flags = format!("--max-old-space-size={heap_mb}");
+            builder = builder.arg(("js-flags", js_flags.as_str()));
         }
 
         // Stealth: add anti-detection Chrome flags

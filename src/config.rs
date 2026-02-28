@@ -14,6 +14,11 @@ pub struct BrowserConfig {
     pub proxy: Option<ProxyConfig>,
     /// Default timeout for operations like `wait_for_selector` (default: 30s).
     pub default_timeout: Duration,
+    /// Enable low-resource mode for constrained devices (Raspberry Pi, ARM SBCs).
+    /// Adds aggressive memory/CPU reduction flags and limits JS heap size.
+    pub low_resource: bool,
+    /// Optional JS heap size limit in MB (used with low_resource mode).
+    pub js_heap_size_mb: Option<u32>,
 }
 
 /// Proxy configuration.
@@ -37,6 +42,8 @@ impl Default for BrowserConfig {
             chrome_path: None,
             proxy: None,
             default_timeout: Duration::from_secs(30),
+            low_resource: false,
+            js_heap_size_mb: None,
         }
     }
 }
@@ -50,6 +57,44 @@ impl BrowserBuilder {
         Self {
             config: BrowserConfig::default(),
         }
+    }
+
+    /// Preset for Raspberry Pi and other ARM single-board computers.
+    /// Sets headless mode, 1280x720 viewport, low-resource flags, 256MB JS heap,
+    /// and auto-detects the Chromium binary path on Raspberry Pi OS.
+    pub fn raspi(mut self) -> Self {
+        self.config.headless = true;
+        self.config.viewport_width = 1280;
+        self.config.viewport_height = 720;
+        self.config.low_resource = true;
+        self.config.js_heap_size_mb = Some(256);
+        self.config.default_timeout = Duration::from_secs(60);
+        // Auto-detect Chromium on Raspberry Pi OS / Debian ARM
+        if self.config.chrome_path.is_none() {
+            for path in &[
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+            ] {
+                if std::path::Path::new(path).exists() {
+                    self.config.chrome_path = Some(path.to_string());
+                    break;
+                }
+            }
+        }
+        self
+    }
+
+    /// Enable low-resource mode for constrained devices.
+    /// Adds aggressive memory/CPU reduction Chrome flags.
+    pub fn low_resource(mut self, enabled: bool) -> Self {
+        self.config.low_resource = enabled;
+        self
+    }
+
+    /// Set the JS heap size limit in MB (e.g., 256 for Raspberry Pi).
+    pub fn js_heap_size_mb(mut self, size: u32) -> Self {
+        self.config.js_heap_size_mb = Some(size);
+        self
     }
 
     pub fn headless(mut self, headless: bool) -> Self {
