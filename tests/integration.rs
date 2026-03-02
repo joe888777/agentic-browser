@@ -177,3 +177,28 @@ async fn test_block_resources() {
     let title = page.title().await.expect("Failed to get title");
     assert!(title.contains("Example"), "Title was: {title}");
 }
+
+#[tokio::test]
+async fn test_goto_stable() {
+    let browser = AgenticBrowser::builder()
+        .headless(true)
+        .build()
+        .await
+        .expect("Failed to launch browser");
+
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .expect("Failed to open page");
+
+    page.goto_stable("https://example.com")
+        .await
+        .expect("Failed to goto_stable");
+
+    let title = page.title().await.expect("Failed to get title");
+    assert!(title.contains("Example"), "Title was: {title}");
+
+    // DOM should be fully stable — selectors should work immediately
+    let text = page.text_content("h1").await.expect("Failed to get h1 text");
+    assert_eq!(text, "Example Domain");
+}

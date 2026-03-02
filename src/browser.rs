@@ -20,6 +20,9 @@ const PERF_ARGS: &[&str] = &[
     "metrics-recording-only",
     "mute-audio",
     "no-default-browser-check",
+    "disable-client-side-phishing-detection",
+    "disable-popup-blocking",
+    "disable-prompt-on-repost",
 ];
 
 /// Additional Chrome flags for low-resource environments (Raspberry Pi, ARM SBCs).
@@ -38,7 +41,7 @@ const LOW_RESOURCE_ARGS: &[&str] = &[
     "disable-sync",
     "disable-translate",
     "disable-domain-reliability",
-    "disable-features=TranslateUI",
+    "disable-site-isolation-trials",
     "no-zygote",
 ];
 
@@ -145,6 +148,7 @@ impl AgenticBrowser {
     /// Open a new page (tab) navigated to the given URL.
     /// If stealth mode is enabled, anti-detection scripts are injected before navigation.
     /// If proxy auth is configured, it handles 407 challenges automatically.
+    /// Stealth and proxy auth setup run in parallel for faster page creation.
     pub async fn new_page(&self, url: &str) -> Result<Page> {
         let cr_page = self
             .browser
@@ -152,69 +156,26 @@ impl AgenticBrowser {
             .await
             .map_err(|e| Error::NavigationError(e.to_string()))?;
 
-        // Inject stealth scripts BEFORE navigating to the target URL
-        if self.stealth {
-            stealth::apply_stealth(&cr_page).await?;
-        }
+        // Run stealth injection and proxy auth setup in parallel
+        let stealth_fut = async {
+            if self.stealth {
+                stealth::apply_stealth(&cr_page).await
+            } else {
+                Ok(())
+            }
+        };
 
-        // Set up proxy authentication if credentials are provided
-        if let Some((ref username, ref password)) = self.proxy_auth {
-            // Set up event listeners BEFORE enabling fetch domain to avoid race condition
-            let mut auth_events = cr_page
-                .event_listener::<EventAuthRequired>()
-                .await
-                .map_err(|e| Error::LaunchError(format!("Failed to listen for auth events: {e}")))?;
+        let proxy_fut = async {
+            if let Some((ref username, ref password)) = self.proxy_auth {
+                Self::setup_proxy_auth(&cr_page, username, password).await
+            } else {
+                Ok(())
+            }
+        };
 
-            let mut pause_events = cr_page
-                .event_listener::<EventRequestPaused>()
-                .await
-                .map_err(|e| Error::LaunchError(format!("Failed to listen for request paused events: {e}")))?;
-
-            // Now enable fetch domain — listeners are already subscribed
-            let enable_params = EnableParams::builder()
-                .handle_auth_requests(true)
-                .build();
-            cr_page
-                .execute(enable_params)
-                .await
-                .map_err(|e| Error::LaunchError(format!("Failed to enable fetch for proxy auth: {e}")))?;
-
-            // Listen for auth challenges and respond with credentials
-            let username = Arc::clone(username);
-            let password = Arc::clone(password);
-            let page_clone = cr_page.clone();
-
-            tokio::spawn(async move {
-                while let Some(event) = auth_events.next().await {
-                    let auth_response = match fetch::AuthChallengeResponse::builder()
-                        .response(AuthChallengeResponseResponse::ProvideCredentials)
-                        .username(username.as_ref())
-                        .password(password.as_ref())
-                        .build()
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("Failed to build auth response: {e}");
-                            continue;
-                        }
-                    };
-                    let params = ContinueWithAuthParams::new(
-                        event.request_id.clone(),
-                        auth_response,
-                    );
-                    let _ = page_clone.execute(params).await;
-                }
-            });
-
-            // Also continue non-auth paused requests
-            let page_clone2 = cr_page.clone();
-            tokio::spawn(async move {
-                while let Some(event) = pause_events.next().await {
-                    let params = fetch::ContinueRequestParams::new(event.request_id.clone());
-                    let _ = page_clone2.execute(params).await;
-                }
-            });
-        }
+        let (stealth_result, proxy_result) = tokio::join!(stealth_fut, proxy_fut);
+        stealth_result?;
+        proxy_result?;
 
         cr_page
             .goto(url)
@@ -222,6 +183,71 @@ impl AgenticBrowser {
             .map_err(|e| Error::NavigationError(e.to_string()))?;
 
         Ok(Page::new(cr_page, self.default_timeout))
+    }
+
+    /// Set up proxy authentication handlers for a page.
+    async fn setup_proxy_auth(
+        cr_page: &chromiumoxide::page::Page,
+        username: &Arc<str>,
+        password: &Arc<str>,
+    ) -> Result<()> {
+        // Set up event listeners BEFORE enabling fetch domain to avoid race condition
+        let mut auth_events = cr_page
+            .event_listener::<EventAuthRequired>()
+            .await
+            .map_err(|e| Error::LaunchError(format!("Failed to listen for auth events: {e}")))?;
+
+        let mut pause_events = cr_page
+            .event_listener::<EventRequestPaused>()
+            .await
+            .map_err(|e| Error::LaunchError(format!("Failed to listen for request paused events: {e}")))?;
+
+        // Now enable fetch domain — listeners are already subscribed
+        let enable_params = EnableParams::builder()
+            .handle_auth_requests(true)
+            .build();
+        cr_page
+            .execute(enable_params)
+            .await
+            .map_err(|e| Error::LaunchError(format!("Failed to enable fetch for proxy auth: {e}")))?;
+
+        // Listen for auth challenges and respond with credentials
+        let username = Arc::clone(username);
+        let password = Arc::clone(password);
+        let page_clone = cr_page.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = auth_events.next().await {
+                let auth_response = match fetch::AuthChallengeResponse::builder()
+                    .response(AuthChallengeResponseResponse::ProvideCredentials)
+                    .username(username.as_ref())
+                    .password(password.as_ref())
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Failed to build auth response: {e}");
+                        continue;
+                    }
+                };
+                let params = ContinueWithAuthParams::new(
+                    event.request_id.clone(),
+                    auth_response,
+                );
+                let _ = page_clone.execute(params).await;
+            }
+        });
+
+        // Also continue non-auth paused requests
+        let page_clone2 = cr_page.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pause_events.next().await {
+                let params = fetch::ContinueRequestParams::new(event.request_id.clone());
+                let _ = page_clone2.execute(params).await;
+            }
+        });
+
+        Ok(())
     }
 
     /// Return all currently open pages (tabs).

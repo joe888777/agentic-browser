@@ -78,6 +78,60 @@ impl Page {
         Ok(())
     }
 
+    /// Navigate to the given URL and wait for the DOM to stabilize.
+    /// Waits for DOMContentLoaded, then waits until no DOM mutations occur for 500ms.
+    /// Best for pages with JS-rendered content where you need reliable selectors.
+    pub async fn goto_stable(&self, url: &str) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
+
+        let params = NavigateParams::new(url);
+        self.inner
+            .execute(params)
+            .await
+            .map_err(|e| Error::NavigationError(e.to_string()))?;
+
+        let timeout_ms = self.default_timeout.as_millis() as u64;
+        let js = format!(
+            r#"new Promise((resolve, reject) => {{
+                const QUIET_MS = 500;
+                const TIMEOUT = {timeout_ms};
+                const deadline = setTimeout(() => {{
+                    if (typeof obs !== 'undefined') obs.disconnect();
+                    resolve();
+                }}, TIMEOUT);
+                function waitForQuiet() {{
+                    let timer;
+                    const obs = new MutationObserver(() => {{
+                        clearTimeout(timer);
+                        timer = setTimeout(() => {{
+                            obs.disconnect();
+                            clearTimeout(deadline);
+                            resolve();
+                        }}, QUIET_MS);
+                    }});
+                    obs.observe(document.documentElement, {{
+                        childList: true, subtree: true, attributes: true
+                    }});
+                    timer = setTimeout(() => {{
+                        obs.disconnect();
+                        clearTimeout(deadline);
+                        resolve();
+                    }}, QUIET_MS);
+                }}
+                if (document.readyState === 'loading') {{
+                    document.addEventListener('DOMContentLoaded', waitForQuiet, {{ once: true }});
+                }} else {{
+                    waitForQuiet();
+                }}
+            }})"#
+        );
+        self.inner
+            .evaluate(js)
+            .await
+            .map_err(|e| Error::NavigationError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Navigate back in the browser history.
     pub async fn go_back(&self) -> Result<()> {
         self.inner
@@ -201,34 +255,38 @@ impl Page {
     /// Fill multiple form fields in a single operation.
     /// Each entry is (css_selector, value). Much faster than calling `type_text`
     /// repeatedly because it batches everything into one JS evaluation.
-    /// Dispatches `input`, `change`, and `blur` events for framework compatibility.
+    /// Dispatches `input` and `change` events for framework compatibility.
+    /// Only blurs the last field to minimize DOM event overhead.
     pub async fn fill_form(&self, fields: &[(&str, &str)]) -> Result<()> {
         let fields_json = serde_json::to_string(
-            &fields.iter().map(|(s, v)| serde_json::json!({"selector": s, "value": v}))
-                .collect::<Vec<_>>()
+            &fields.iter().enumerate().map(|(i, (s, v))| {
+                serde_json::json!({"selector": s, "value": v, "last": i == fields.len() - 1})
+            }).collect::<Vec<_>>()
         ).map_err(|e| Error::JsError(e.to_string()))?;
 
         let js = format!(
             r#"(() => {{
                 const fields = {fields_json};
                 const errors = [];
+                const inputSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                )?.set;
+                const textareaSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype, 'value'
+                )?.set;
                 for (const f of fields) {{
                     const el = document.querySelector(f.selector);
                     if (!el) {{ errors.push('Not found: ' + f.selector); continue; }}
                     el.focus();
-                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    )?.set || Object.getOwnPropertyDescriptor(
-                        window.HTMLTextAreaElement.prototype, 'value'
-                    )?.set;
-                    if (nativeInputValueSetter) {{
-                        nativeInputValueSetter.call(el, f.value);
+                    const setter = inputSetter || textareaSetter;
+                    if (setter) {{
+                        setter.call(el, f.value);
                     }} else {{
                         el.value = f.value;
                     }}
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    el.blur();
+                    if (f.last) el.blur();
                 }}
                 if (errors.length > 0) throw new Error(errors.join('; '));
             }})()"#,
@@ -514,22 +572,25 @@ impl Page {
 
     /// Build a compact accessibility tree representation of the page DOM,
     /// suitable for LLM consumption. Shows roles, labels, links, form elements.
+    /// Uses Set-based lookups and cached getAttribute calls for performance.
     pub async fn accessibility_tree(&self) -> Result<String> {
         let js = r#"
             JSON.stringify((function() {
+                const SKIP = new Set(['script','style','noscript','meta','link','head']);
+                const INTERACTIVE = new Set(['a','button','input','select','textarea']);
+                const LANDMARK = new Set(['main','nav','header','footer','aside','section','article','form']);
                 function getRole(el) {
                     return el.getAttribute('role') || el.tagName.toLowerCase();
                 }
                 function getLabel(el) {
-                    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
-                    if (el.id) {
-                        const label = document.querySelector('label[for="' + el.id + '"]');
+                    const ariaLabel = el.getAttribute('aria-label');
+                    if (ariaLabel) return ariaLabel;
+                    const id = el.id;
+                    if (id) {
+                        const label = document.querySelector('label[for="' + id + '"]');
                         if (label) return (label.innerText || '').trim();
                     }
-                    if (el.getAttribute('alt')) return el.getAttribute('alt');
-                    if (el.getAttribute('title')) return el.getAttribute('title');
-                    if (el.getAttribute('placeholder')) return el.getAttribute('placeholder');
-                    return '';
+                    return el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || '';
                 }
                 function walk(node, depth) {
                     const lines = [];
@@ -545,8 +606,7 @@ impl Page {
                     const el = node;
                     const tag = el.tagName.toLowerCase();
 
-                    // Skip invisible elements
-                    if (['script','style','noscript','meta','link','head'].includes(tag)) return lines;
+                    if (SKIP.has(tag)) return lines;
                     if (typeof el.checkVisibility === 'function') {
                         if (!el.checkVisibility({checkOpacity: false, checkVisibilityCSS: true})) return lines;
                     } else if (el.offsetParent === null && tag !== 'body' && tag !== 'html') {
@@ -555,32 +615,31 @@ impl Page {
 
                     const role = getRole(el);
                     const label = getLabel(el);
-                    const interactable = ['a','button','input','select','textarea'].includes(tag);
-                    const isLandmark = ['main','nav','header','footer','aside','section','article','form'].includes(tag)
-                        || el.getAttribute('role');
+                    const isInteractive = INTERACTIVE.has(tag);
+                    const isLandmark = LANDMARK.has(tag) || el.getAttribute('role');
 
-                    if (interactable || isLandmark) {
+                    if (isInteractive || isLandmark) {
                         let desc = indent + '[' + role + ']';
                         if (label) desc += ' "' + label + '"';
                         if (tag === 'a' && el.href) desc += ' href=' + el.href;
                         if (tag === 'input') {
-                            desc += ' type=' + (el.type || 'text');
+                            const t = el.type || 'text';
+                            desc += ' type=' + t;
                             if (el.name) desc += ' name=' + el.name;
                             if (el.value) desc += ' value="' + el.value.substring(0, 50) + '"';
                         }
-                        if (tag === 'select') {
-                            if (el.name) desc += ' name=' + el.name;
-                        }
-                        if (tag === 'button' || (tag === 'input' && ['submit','button'].includes(el.type))) {
+                        if (tag === 'select' && el.name) desc += ' name=' + el.name;
+                        if ((tag === 'button' || (tag === 'input' && (el.type === 'submit' || el.type === 'button'))) && !label) {
                             const btnText = (el.innerText || el.value || '').trim();
-                            if (btnText && !label) desc += ' "' + btnText + '"';
+                            if (btnText) desc += ' "' + btnText + '"';
                         }
                         lines.push(desc);
                     }
 
+                    const nextDepth = (isInteractive || isLandmark) ? depth + 1 : depth;
                     for (const child of el.childNodes) {
-                        const childLines = walk(child, interactable || isLandmark ? depth + 1 : depth);
-                        lines.push(...childLines);
+                        const childLines = walk(child, nextDepth);
+                        for (let i = 0; i < childLines.length; i++) lines.push(childLines[i]);
                     }
                     return lines;
                 }
