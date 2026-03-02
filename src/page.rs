@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chromiumoxide::page::Page as CrPage;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use tokio::task::AbortHandle;
 
 use crate::element::Element;
 use crate::error::{Error, Result};
@@ -29,14 +31,36 @@ pub struct FormField {
 }
 
 /// Wrapper around a chromiumoxide Page with a simplified, agent-friendly API.
+///
+/// **Memory safety:** All background tasks (proxy auth, resource blocking) are tracked
+/// via abort handles and automatically cancelled when the Page is dropped. For immediate
+/// cleanup on memory-constrained devices, call `close()` instead of letting the Page
+/// go out of scope.
 pub struct Page {
     inner: CrPage,
     default_timeout: Duration,
+    abort_handles: Arc<std::sync::Mutex<Vec<AbortHandle>>>,
 }
 
 impl Page {
     pub(crate) fn new(inner: CrPage, default_timeout: Duration) -> Self {
-        Self { inner, default_timeout }
+        Self {
+            inner,
+            default_timeout,
+            abort_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) fn new_with_handles(
+        inner: CrPage,
+        default_timeout: Duration,
+        handles: Vec<AbortHandle>,
+    ) -> Self {
+        Self {
+            inner,
+            default_timeout,
+            abort_handles: Arc::new(std::sync::Mutex::new(handles)),
+        }
     }
 
     /// Returns a reference to the underlying chromiumoxide Page.
@@ -406,7 +430,7 @@ impl Page {
             .map_err(|e| Error::JsError(format!("Failed to enable fetch for resource blocking: {e}")))?;
 
         let page = self.inner.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(event) = pause_events.next().await {
                 let params = FailRequestParams::new(
                     event.request_id.clone(),
@@ -415,6 +439,7 @@ impl Page {
                 let _ = page.execute(params).await;
             }
         });
+        self.abort_handles.lock().unwrap().push(handle.abort_handle());
 
         Ok(())
     }
@@ -743,5 +768,46 @@ impl Page {
             .await
             .map_err(|e| Error::ElementNotFound(e.to_string()))?;
         Ok(els.into_iter().map(Element::new).collect())
+    }
+
+    // ── Lifecycle ───────────────────────────────────────────────────
+
+    /// Close the page, aborting all background tasks and releasing resources.
+    /// On memory-constrained devices (Raspberry Pi), call this when done with a page
+    /// to immediately reclaim memory instead of waiting for drop.
+    pub async fn close(self) -> Result<()> {
+        // Abort all spawned background tasks (proxy auth, resource blocking)
+        if let Ok(mut handles) = self.abort_handles.lock() {
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+        }
+        // Stop any in-flight loads
+        let _ = self.inner.evaluate("window.stop()").await;
+        // Close the tab via CDP Page.close
+        use chromiumoxide::cdp::browser_protocol::page::CloseParams;
+        let _ = self.inner.execute(CloseParams {}).await;
+        Ok(())
+    }
+
+    /// Force V8 garbage collection on the Chrome renderer process.
+    /// Useful on memory-constrained devices to reclaim memory between navigations.
+    pub async fn force_gc(&self) -> Result<()> {
+        use chromiumoxide::cdp::js_protocol::heap_profiler::CollectGarbageParams;
+        self.inner
+            .execute(CollectGarbageParams {})
+            .await
+            .map_err(|e| Error::JsError(format!("Failed to force GC: {e}")))?;
+        Ok(())
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        if let Ok(handles) = self.abort_handles.lock() {
+            for handle in handles.iter() {
+                handle.abort();
+            }
+        }
     }
 }

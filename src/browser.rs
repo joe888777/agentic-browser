@@ -7,6 +7,7 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::handler::viewport::Viewport;
 use futures::StreamExt;
+use tokio::task::AbortHandle;
 
 use crate::config::{BrowserBuilder, BrowserConfig};
 use crate::error::{Error, Result};
@@ -84,6 +85,10 @@ impl AgenticBrowser {
             let heap_mb = config.js_heap_size_mb.unwrap_or(256);
             let js_flags = format!("--max-old-space-size={heap_mb}");
             builder = builder.arg(("js-flags", js_flags.as_str()));
+            // Limit to 1 renderer process — huge memory savings on Pi
+            builder = builder.arg(("renderer-process-limit", "1"));
+            // Minimize disk cache to reduce swap pressure
+            builder = builder.arg(("disk-cache-size", "1"));
         }
 
         // Stealth: add anti-detection Chrome flags
@@ -169,28 +174,30 @@ impl AgenticBrowser {
             if let Some((ref username, ref password)) = self.proxy_auth {
                 Self::setup_proxy_auth(&cr_page, username, password).await
             } else {
-                Ok(())
+                Ok(vec![])
             }
         };
 
         let (stealth_result, proxy_result) = tokio::join!(stealth_fut, proxy_fut);
         stealth_result?;
-        proxy_result?;
+        let abort_handles = proxy_result?;
 
         cr_page
             .goto(url)
             .await
             .map_err(|e| Error::NavigationError(e.to_string()))?;
 
-        Ok(Page::new(cr_page, self.default_timeout))
+        Ok(Page::new_with_handles(cr_page, self.default_timeout, abort_handles))
     }
 
     /// Set up proxy authentication handlers for a page.
+    /// Returns abort handles for the spawned listener tasks so they can be
+    /// cancelled when the page is closed (prevents memory leaks).
     async fn setup_proxy_auth(
         cr_page: &chromiumoxide::page::Page,
         username: &Arc<str>,
         password: &Arc<str>,
-    ) -> Result<()> {
+    ) -> Result<Vec<AbortHandle>> {
         // Set up event listeners BEFORE enabling fetch domain to avoid race condition
         let mut auth_events = cr_page
             .event_listener::<EventAuthRequired>()
@@ -216,7 +223,7 @@ impl AgenticBrowser {
         let password = Arc::clone(password);
         let page_clone = cr_page.clone();
 
-        tokio::spawn(async move {
+        let auth_task = tokio::spawn(async move {
             while let Some(event) = auth_events.next().await {
                 let auth_response = match fetch::AuthChallengeResponse::builder()
                     .response(AuthChallengeResponseResponse::ProvideCredentials)
@@ -240,14 +247,14 @@ impl AgenticBrowser {
 
         // Also continue non-auth paused requests
         let page_clone2 = cr_page.clone();
-        tokio::spawn(async move {
+        let pause_task = tokio::spawn(async move {
             while let Some(event) = pause_events.next().await {
                 let params = fetch::ContinueRequestParams::new(event.request_id.clone());
                 let _ = page_clone2.execute(params).await;
             }
         });
 
-        Ok(())
+        Ok(vec![auth_task.abort_handle(), pause_task.abort_handle()])
     }
 
     /// Return all currently open pages (tabs).

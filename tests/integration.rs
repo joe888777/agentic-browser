@@ -179,6 +179,44 @@ async fn test_block_resources() {
 }
 
 #[tokio::test]
+async fn test_close_page() {
+    let browser = AgenticBrowser::builder()
+        .headless(true)
+        .build()
+        .await
+        .expect("Failed to launch browser");
+
+    let page = browser
+        .new_page("https://example.com")
+        .await
+        .expect("Failed to open page");
+
+    // Verify page works
+    let title = page.title().await.expect("Failed to get title");
+    assert!(title.contains("Example"), "Title was: {title}");
+
+    // Close should succeed and release resources
+    page.close().await.expect("Failed to close page");
+}
+
+#[tokio::test]
+async fn test_force_gc() {
+    let browser = AgenticBrowser::builder()
+        .headless(true)
+        .build()
+        .await
+        .expect("Failed to launch browser");
+
+    let page = browser
+        .new_page("https://example.com")
+        .await
+        .expect("Failed to open page");
+
+    // force_gc should succeed without error
+    page.force_gc().await.expect("Failed to force GC");
+}
+
+#[tokio::test]
 async fn test_goto_stable() {
     let browser = AgenticBrowser::builder()
         .headless(true)
